@@ -450,7 +450,7 @@ class socksocket(_BaseSocket):
 
     def _SOCKS5_request(self, conn, cmd, dst):
         """Send SOCKS5 request with given command (CMD field) and address (DST field). Returns resolved DST address that was used."""
-        log.debug('request, %s, %s, %s', conn, cmd, dst)
+        log.debug('request, %s, %s, %s', type(conn), cmd, dst)
         proxy_type, addr, port, rdns, username, password = self.proxy
 
         writer = conn.makefile("wb")
@@ -518,6 +518,7 @@ class socksocket(_BaseSocket):
 
             # Get the bound address/port
             bnd = self._read_SOCKS5_address(reader)
+            log.debug('get addr: %s', bnd)
 
             super(socksocket, self).settimeout(self._timeout)
             return (resolved, bnd)
@@ -567,16 +568,24 @@ class socksocket(_BaseSocket):
         log.debug('read_socks5_address')
         atyp = self._readall(file, 1)
         if atyp == b"\x01":
-            addr = socket.inet_ntoa(self._readall(file, 4))
+            buf = self._readall(file, 4)
+            addr = socket.inet_ntoa(buf)
+            log.debug('read buf: %s, addr: %s', buf, addr)
         elif atyp == b"\x03":
             length = self._readall(file, 1)
-            addr = self._readall(file, ord(length))
+            buf = self._readall(file, ord(length))
+            addr = buf
+            log.debug('read buf: %s, addr: %s', buf, addr)
         elif atyp == b"\x04":
-            addr = socket.inet_ntop(socket.AF_INET6, self._readall(file, 16))
+            buf = self._readall(file, 16)
+            addr = socket.inet_ntop(socket.AF_INET6, buf)
+            log.debug('read buf: %s, addr: %s', buf, addr)
         else:
             raise GeneralProxyError("SOCKS5 proxy server sent invalid data")
 
-        port = struct.unpack(">H", self._readall(file, 2))[0]
+        port_buf = self._readall(file, 2)
+        port = struct.unpack(">H", port_buf)[0]
+        log.debug('read buf: %s, port: %s', port_buf, port)
         return addr, port
 
     def _negotiate_SOCKS4(self, dest_addr, dest_port):

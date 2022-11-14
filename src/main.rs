@@ -29,8 +29,9 @@ pub async fn main() -> io::Result<()> {
     pretty_env_logger::init();
 
     // 设置一个TcpLintener用于接收来自客户端的连接，开启一个socks5代理。
-    let listener = TcpListener::bind("0.0.0.0:8888").await?;
+    let listener = TcpListener::bind("0.0.0.0:2080").await?;
 
+    info!("listening on 0.0.0.0:2080 ...");
     // 一直循环，不断接收一个新收到的连接，因为可能在同一个时刻需要接收上百个sock5的代理连接。
     loop {
         let (socket, addr) = listener.accept().await.unwrap();
@@ -116,8 +117,23 @@ async fn negotiate(socket: &mut TcpStream, _addr: &SocketAddr, buf: &mut [u8]) -
 async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
     info!("request");
 
+    /*
+    +----+-----+-------+------+----------+----------+
+    |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+    +----+-----+-------+------+----------+----------+
+    | 1  |  1  | X'00' |  1   | Variable |    2     |
+    +----+-----+-------+------+----------+----------+
+
+    ipv4:
+    0 1 2 3 4..8 9..11
+
+    domain:
+    0 1 2 3 4     5..(5+len+1) 5+len+1 .. 5+len+1+2
+            (len)
+    */
+
     // 期望获得客户端发送的request数据，（这里我们只获取前6字节）
-    socket.read_exact(&mut buf[0..6]).await?;
+    socket.read_exact(&mut buf[0..4]).await?;
 
     if buf[0] != 0x05u8 {
         return Err(io::Error::new(
@@ -128,10 +144,7 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
     let command = buf[1];
     let atype = buf[3];
     let mut tg_addr: Option<SocketAddr> = None;
-    debug!(
-        "command: {:?}, atype: {:?}, target addr: {:?}",
-        command, atype, tg_addr
-    );
+    debug!("command: {:?}, atype: {:?}", command, atype);
 
     debug!("check atype: {:?}", atype);
 
@@ -153,8 +166,10 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
         0x03 => {
             debug!("domain name");
             // 如果是域名则，则需要进行解析，然后填入地址中，并放入对于端口到addr中。
-            socket.read_exact(&mut buf[0..1]).await?;
-            let domainname_len = buf[6..7].as_ref().read_u8().await? as usize;
+            socket.read_exact(&mut buf[4..5]).await?;
+
+            // let domainname_len = buf[6..7].as_ref().read_u8().await? as usize;
+            let domainname_len = buf[4..5].as_ref().read_u8().await? as usize;
             info!("domainname len :{}", domainname_len);
 
             // 从tcp连接中读取域名和端口号
@@ -163,9 +178,11 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
                 .as_ref()
                 .read_u16()
                 .await?;
+            debug!("port: {:?}", port);
 
             // 调用tokio的lookup_host找到域名对于的dns地址
             if let Ok(domainname_str) = std::str::from_utf8(&buf[0..domainname_len]) {
+                debug!("domain: {:?}", domainname_str);
                 for addr in tokio::net::lookup_host((domainname_str, port)).await? {
                     tg_addr = Some(addr);
                 }
@@ -186,7 +203,7 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
         }
         _ => {
             // 不支持其他的地址类型了，返回错误信息fail.
-            error!("unsupported address type");
+            error!("check atype, unsupported address type");
         }
     }
 
@@ -198,6 +215,7 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
     // 没有获取到对于的ip地址，则说明是地址类型不支持，0x08错误码发送给客户端
     // 当解析失败的时候，给客户端发送错误码0x08
     if None == tg_addr {
+        error!("tg_addr is None");
         socket
             .write_all(&[0x05u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
             .await?;
@@ -208,10 +226,16 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
     /* 根据客户端command进行对于的操作 */
     match command {
         0x01 => {
+            debug!("command CONNECT");
             // 表示连接到对方服务器
             let target_stream = TcpStream::connect(&tg_addr).await?;
             let local_addr = target_stream.local_addr()?;
-            send_receipt(0x00_u8, &local_addr, &mut socket).await?;
+            debug!("proxy => target: {:?} => {:?}", local_addr, tg_addr);
+
+            // Tell proxy client it's good.
+            let proxy_server_addr = socket.peer_addr()?;
+            send_receipt(0x00_u8, &proxy_server_addr, &mut socket).await?;
+
             relay_tcp(target_stream, socket).await?;
         }
         0x02 => {
@@ -252,22 +276,36 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
 }
 
 /*
- * 向客户端发送一个receipt
+ * 向客户端发送一个receipt，是 request 的响应 *
  */
 async fn send_receipt(
     result: u8,
     socket_addr: &SocketAddr,
-    tg_stream: &mut TcpStream,
+    target_stream: &mut TcpStream,
 ) -> io::Result<bool> {
+    /* +----+-----+-------+------+----------+----------+
+     * |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+     * +----+-----+-------+------+----------+----------+
+     * | 1  |  1  | X'00' |  1   | Variable |    2     |
+     * +----+-----+-------+------+----------+----------+
+     *
+     * 当我们的socks5 server和relay server不是一体的，就需要告知客户端relay server的地址，这个地址就是BND.ADDR和BND.PORT。
+     * 当我们的relay server和socks5 server是同一台服务器时，BND.ADDR和BND.PORT的值全部为0即可。
+     */
     let mut target = [0u8; 21];
     target[..3].clone_from_slice(&[0x05u8, result, 0x00]);
 
+    debug!("addr: {:?}", socket_addr);
     match socket_addr {
         SocketAddr::V4(addr) => {
             target[3] = 0x01;
-            target[3..7].clone_from_slice(&addr.ip().octets());
-            target[7..9].as_mut().write_u16::<BigEndian>(addr.port())?;
-            tg_stream.write_all(&target[0..9]).await?;
+            // target[3..7].clone_from_slice(&addr.ip().octets());
+            // target[7..9].as_mut().write_u16::<BigEndian>(addr.port())?;
+            target[4..8].clone_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            target[8..10].clone_from_slice(&[0x00, 0x00]);
+            debug!("recipt: {:?}", &target[0..10]);
+
+            target_stream.write_all(&target[0..10]).await?;
         }
         SocketAddr::V6(addr) => {
             target[3] = 0x04;
@@ -275,10 +313,10 @@ async fn send_receipt(
             target[19..21]
                 .as_mut()
                 .write_u16::<BigEndian>(addr.port())?;
-            tg_stream.write_all(&target[0..21]).await?;
+            target_stream.write_all(&target[0..21]).await?;
         }
     };
-    tg_stream.flush().await?;
+    target_stream.flush().await?;
     Ok(true)
 }
 
@@ -286,15 +324,19 @@ async fn send_receipt(
  * 将两个tcp数据串起来,两个tcpstream数据之间相互转发数据
  */
 async fn relay_tcp(mut stream1: TcpStream, mut stream2: TcpStream) -> io::Result<()> {
+    debug!("relay");
     // 按照socks5协议,在监听模式中,在接受到一个新的连接的时候,代理服务器就再发一个receipt
     let (mut remote_rx, mut remote_tx) = stream1.split();
     let (mut local_rx, mut local_tx) = stream2.split();
-    let r2l = tokio::io::copy(&mut remote_rx, &mut local_tx);
-    let l2r = tokio::io::copy(&mut local_rx, &mut remote_tx);
-    let result = tokio::try_join!(r2l, l2r);
+    let remote_to_local = tokio::io::copy(&mut remote_rx, &mut local_tx);
+    let local_to_remote = tokio::io::copy(&mut local_rx, &mut remote_tx);
+    let result = tokio::try_join!(remote_to_local, local_to_remote);
     if let Err(_) = result {
         // 如果任意一端出现了错误,那么就静默的关闭连接即可,以防客户端把数据当做目的服务器的数据
-        return Err(io::Error::new(io::ErrorKind::Other, "unsupported address"));
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "replay - unsupported address",
+        ));
     };
     Ok(())
 }

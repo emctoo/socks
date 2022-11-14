@@ -27,6 +27,7 @@ def create_connection(address, timeout=None, source_address=None):
 parser = argparse.ArgumentParser()
 parser.add_argument('host')
 parser.add_argument('-p', dest='port', type=int, default=80)
+# parser.add_argument('--proxy', type=str, default='socks5://192.168.8.46:2080')
 parser.add_argument('--proxy', type=str, default='socks5://127.0.0.1:2080')
 
 args = parser.parse_args()
