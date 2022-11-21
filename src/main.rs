@@ -330,6 +330,7 @@ async fn relay_tcp(mut stream1: TcpStream, mut stream2: TcpStream) -> io::Result
     let (mut local_rx, mut local_tx) = stream2.split();
     let remote_to_local = tokio::io::copy(&mut remote_rx, &mut local_tx);
     let local_to_remote = tokio::io::copy(&mut local_rx, &mut remote_tx);
+
     let result = tokio::try_join!(remote_to_local, local_to_remote);
     if let Err(_) = result {
         // 如果任意一端出现了错误,那么就静默的关闭连接即可,以防客户端把数据当做目的服务器的数据
